@@ -18,6 +18,8 @@ defined( 'WSP_GITHUB_BRANCH' ) || define( 'WSP_GITHUB_BRANCH', 'main' );
 
 require_once __DIR__ . '/includes/class-github-updater.php';
 require_once __DIR__ . '/includes/class-timeline-filter.php';
+require_once __DIR__ . '/admin/class-admin-menu.php';
+
 
 if ( is_admin() ) {
     new \Woven\Superpowers\GitHub_Updater( __FILE__, WSP_GITHUB_REPO, WSP_GITHUB_BRANCH );
