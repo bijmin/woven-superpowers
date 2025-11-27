@@ -9,10 +9,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Timeline_Filter {
     protected $active_filter_ids = null;
     protected $filters_attached  = false;
+    protected static $instance   = null;
 
     public static function boot(): void {
         if ( static::is_enabled() ) {
-            new static();
+            static::$instance = new static();
         }
     }
 
@@ -23,7 +24,8 @@ class Timeline_Filter {
 
     public function __construct() {
         add_action( 'elementor/widgets/widgets_registered', [ $this, 'extend_timeline_widget' ] );
-        add_filter( 'voxel/timeline/query_args', [ $this, 'filter_timeline_by_search' ], 20, 2 );
+        add_action( 'voxel_ajax_timeline/v2/get_feed', [ $this, 'maybe_handle_filtered_feed' ], 5 );
+        add_action( 'voxel_ajax_nopriv_timeline/v2/get_feed', [ $this, 'maybe_handle_filtered_feed' ], 5 );
     }
 
     /**
@@ -34,6 +36,14 @@ class Timeline_Filter {
         if ( ! $widget ) {
             return;
         }
+
+        // Add new mode to the existing Voxel mode selector.
+        $widget->update_control( 'ts_mode', [
+            'options' => array_merge(
+                $widget->get_controls()['ts_mode']['options'] ?? [],
+                [ 'filtered_feed' => __( 'Filtered feed (Woven Superpowers)', 'wsp' ) ]
+            ),
+        ] );
 
         $widget->start_controls_section(
             'wsp_timeline_filters',
@@ -73,33 +83,55 @@ class Timeline_Filter {
         $widget->end_controls_section();
     }
 
-    /**
-     * Inject the filtered search results into the Timeline query.
-     */
-    public function filter_timeline_by_search( $args, $context ) {
-        if ( ! $this->should_filter( $context ) ) {
-            return $args;
+    public function maybe_handle_filtered_feed() {
+        $mode = $_REQUEST['mode'] ?? null;
+        if ( $mode !== 'filtered_feed' ) {
+            return;
         }
 
-        $ids = $this->get_search_post_ids( $context );
+        $ids = $this->resolve_search_ids_from_request();
         if ( $ids === null ) {
-            // no connected search form; leave feed untouched
-            return $args;
+            wp_send_json( [
+                'success' => true,
+                'data' => [],
+                'has_more' => false,
+                'meta' => [ 'review_config' => [] ],
+            ] );
         }
 
         $this->active_filter_ids = $ids;
         $this->attach_sql_filters();
 
-        if ( empty( $ids ) ) {
-            // search returned no posts, force empty feed
-            $args['wsp_filtered_ids'] = [ 0 ];
-            $args['post__in'] = [ 0 ];
-            return $args;
+        $per_page = absint( \Voxel\get( 'settings.timeline.posts.per_page', 10 ) );
+        $args = [
+            'limit' => $per_page + 1,
+            'with_user_like_status' => true,
+            'with_user_repost_status' => true,
+            'moderation' => 1,
+            'with_current_user_visibility_checks' => true,
+            'with_no_reposts' => true,
+        ];
+
+        $args = $this->apply_ordering( $args );
+        $args = $this->apply_timeframe( $args );
+
+        $query = \Voxel\Timeline\Status::query( $args );
+        $statuses = $query['items'];
+        $has_more = $query['count'] > $per_page;
+        if ( $has_more && $query['count'] === count( $statuses ) ) {
+            array_pop( $statuses );
         }
 
-        $args['wsp_filtered_ids'] = $ids;
+        $data = array_map( function( $status ) {
+            return $status->get_frontend_config();
+        }, $statuses );
 
-        return $args;
+        wp_send_json( [
+            'success' => true,
+            'data' => $data,
+            'has_more' => $has_more,
+            'meta' => [ 'review_config' => [] ],
+        ] );
     }
 
     /**
@@ -188,48 +220,45 @@ class Timeline_Filter {
         } ) );
     }
 
-    protected function should_filter( $context ): bool {
-        $settings = $context['element_settings'] ?? [];
-        return ( $settings['wsp_feed_mode'] ?? 'default' ) === 'filtered';
-    }
-
-    protected function get_search_post_ids( array $context ): ?array {
-        // Try connected search form via relation
-        if ( $search_form = $this->locate_related_search_form( $context ) ) {
-            if ( $ids = $this->get_ids_from_search_widget( $search_form ) ) {
-                return $ids;
-            }
-        }
-
-        // Fallback to manually provided search form ID
-        $manual_id = $context['element_settings']['wsp_search_form_id'] ?? null;
-        if ( $manual_id && class_exists( '\Voxel\Dynamic_Data\Search' ) && is_callable( [ '\Voxel\Dynamic_Data\Search', 'get_form_results' ] ) ) {
-            $results = \Voxel\Dynamic_Data\Search::get_form_results( $manual_id );
-            if ( ! empty( $results['ids'] ) && is_array( $results['ids'] ) ) {
-                return array_values( array_filter( array_map( 'absint', $results['ids'] ) ) );
-            }
-
-            return [];
-        }
-
-        return null;
-    }
-
-    protected function locate_related_search_form( array $context ) {
-        $widget = $context['widget'] ?? $context['element'] ?? null;
-        if ( ! ( $widget instanceof \Elementor\Widget_Base ) ) {
+    protected function resolve_search_ids_from_request(): ?array {
+        $referer = wp_get_referer();
+        if ( ! $referer ) {
             return null;
         }
 
-        $template_id = $widget->_get_template_id();
-
-        $search_form = \Voxel\get_related_widget( $widget, $template_id, 'timelineToSearch', 'right' );
-        if ( $search_form ) {
-            return $search_form;
+        $page_id = url_to_postid( $referer );
+        if ( ! $page_id ) {
+            return null;
         }
 
-        // Support the default feedToSearch relation as a fallback
-        return \Voxel\get_related_widget( $widget, $template_id, 'feedToSearch', 'right' );
+        $document = \Elementor\Plugin::$instance->documents->get_doc_for_frontend( $page_id );
+        if ( ! $document ) {
+            return null;
+        }
+
+        $timeline_element = $this->find_filtered_timeline( $document->get_elements_data() );
+        if ( ! $timeline_element ) {
+            return null;
+        }
+
+        $backup_get = $_GET;
+        parse_str( (string) wp_parse_url( $referer, PHP_URL_QUERY ), $referer_query );
+        $_GET = $referer_query;
+
+        $ids = [];
+
+        if ( $search_form = $this->locate_related_search_form( $timeline_element, $document->get_main_id() ) ) {
+            $ids = $this->get_ids_from_search_widget( $search_form );
+        } else {
+            $manual_id = $timeline_element['settings']['wsp_search_form_id'] ?? null;
+            if ( $manual_id ) {
+                $ids = $this->get_ids_from_form_id( $manual_id );
+            }
+        }
+
+        $_GET = $backup_get;
+
+        return $ids;
     }
 
     protected function get_ids_from_search_widget( array $search_form ): array {
@@ -270,6 +299,134 @@ class Timeline_Filter {
         } catch ( \Throwable $e ) {
             return [];
         }
+    }
+
+    protected function get_ids_from_form_id( $form_id ): array {
+        try {
+            $form_id = absint( $form_id );
+            if ( ! $form_id ) {
+                return [];
+            }
+
+            $template = get_post( $form_id );
+            if ( ! $template ) {
+                return [];
+            }
+
+            $document = \Elementor\Plugin::$instance->documents->get_doc_for_frontend( $form_id );
+            if ( ! $document ) {
+                return [];
+            }
+
+            $elements = $document->get_elements_data();
+            $search_widget = $this->find_first_search_form( $elements );
+            if ( ! $search_widget ) {
+                return [];
+            }
+
+            return $this->get_ids_from_search_widget( $search_widget );
+        } catch ( \Throwable $e ) {
+            return [];
+        }
+    }
+
+    protected function find_first_search_form( array $elements ) {
+        foreach ( $elements as $element ) {
+            if ( isset( $element['widgetType'] ) && $element['widgetType'] === 'ts-search-form' ) {
+                return $element;
+            }
+
+            if ( ! empty( $element['elements'] ) ) {
+                if ( $found = $this->find_first_search_form( $element['elements'] ) ) {
+                    return $found;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    protected function locate_related_search_form( array $timeline_element, $template_id ) {
+        try {
+            $widget = new \Voxel\Widgets\Timeline( $timeline_element, [] );
+            $search_form = \Voxel\get_related_widget( $widget, $template_id, 'timelineToSearch', 'right' );
+            if ( $search_form ) {
+                return $search_form;
+            }
+
+            return \Voxel\get_related_widget( $widget, $template_id, 'feedToSearch', 'right' );
+        } catch ( \Throwable $e ) {
+            return null;
+        }
+    }
+
+    protected function find_filtered_timeline( array $elements ) {
+        foreach ( $elements as $element ) {
+            if ( isset( $element['widgetType'] ) && $element['widgetType'] === 'ts-timeline' ) {
+                $mode = $element['settings']['ts_mode'] ?? 'user_feed';
+                if ( $mode === 'filtered_feed' || ( $element['settings']['wsp_feed_mode'] ?? '' ) === 'filtered' ) {
+                    return $element;
+                }
+            }
+
+            if ( ! empty( $element['elements'] ) ) {
+                if ( $found = $this->find_filtered_timeline( $element['elements'] ) ) {
+                    return $found;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    protected function apply_ordering( array $args ): array {
+        $order = $_REQUEST['order_type'] ?? 'latest';
+
+        if ( $order === 'earliest' ) {
+            $args['order_by'] = 'created_at';
+            $args['order'] = 'asc';
+        } elseif ( $order === 'most_liked' ) {
+            $args['order_by'] = 'like_count';
+            $args['order'] = 'desc';
+        } elseif ( $order === 'most_discussed' ) {
+            $args['order_by'] = 'reply_count';
+            $args['order'] = 'desc';
+        } elseif ( $order === 'most_popular' ) {
+            $args['order_by'] = 'interaction_count';
+            $args['order'] = 'desc';
+        } elseif ( $order === 'best_rated' ) {
+            $args['order_by'] = 'rating';
+            $args['order'] = 'desc';
+        } elseif ( $order === 'worst_rated' ) {
+            $args['order_by'] = 'rating';
+            $args['order'] = 'asc';
+        } else {
+            $args['order_by'] = 'created_at';
+            $args['order'] = 'desc';
+        }
+
+        return $args;
+    }
+
+    protected function apply_timeframe( array $args ): array {
+        $time = $_REQUEST['order_time'] ?? 'all_time';
+
+        if ( $time === 'today' ) {
+            $args['created_at'] = \Voxel\utc()->modify( '-24 hours' )->format( 'Y-m-d H:i:s' );
+        } elseif ( $time === 'this_week' ) {
+            $args['created_at'] = \Voxel\utc()->modify( 'first day of this week' )->format( 'Y-m-d 00:00:00' );
+        } elseif ( $time === 'this_month' ) {
+            $args['created_at'] = \Voxel\utc()->modify( 'first day of this month' )->format( 'Y-m-d 00:00:00' );
+        } elseif ( $time === 'this_year' ) {
+            $args['created_at'] = \Voxel\utc()->modify( 'first day of this year' )->format( 'Y-m-d 00:00:00' );
+        } elseif ( $time === 'custom' ) {
+            $custom_time = absint( $_REQUEST['order_time_custom'] ?? null );
+            if ( $custom_time ) {
+                $args['created_at'] = \Voxel\utc()->modify( sprintf( '-%d days', $custom_time ) )->format( 'Y-m-d 00:00:00' );
+            }
+        }
+
+        return $args;
     }
 
     protected function attach_sql_filters(): void {

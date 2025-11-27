@@ -3,7 +3,7 @@
  * Plugin Name: Woven Superpowers
  * Plugin URI: https://github.com/bijmin/woven-superpowers
  * Description: Extends Voxel with new filtering and timeline features.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: Woven Social
  * Author URI: https://wovensocial.nz
  */
